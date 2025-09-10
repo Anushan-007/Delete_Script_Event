@@ -1,0 +1,186 @@
+
+SET NOCOUNT ON;
+
+DECLARE @GlobalForceDelete BIT = 0; -- Set to 1 to force-delete package references related to events
+DECLARE @iEventID INT, @sEventName NVARCHAR(4000);
+
+-- For logging statuses
+DECLARE @Log TABLE (
+    EventID INT,
+    EventName NVARCHAR(4000),
+    Status NVARCHAR(50),
+    Message NVARCHAR(4000),
+    LogTime DATETIME DEFAULT GETDATE()
+);
+
+IF OBJECT_ID('tempdb..#EventMain') IS NOT NULL
+    DROP TABLE #EventMain;
+
+-- =================== Event Selection ===================
+SELECT DISTINCT
+    ROW_NUMBER() OVER (ORDER BY E.EventID) AS EKID,
+    E.EventID,
+    E.Name AS EventName
+INTO #EventMain
+FROM Event E WITH (NOLOCK)
+-- ========================= SELECTION OPTIONS =========================
+-- OPTION 1: Single Event
+ WHERE E.EventID = 293
+
+-- OPTION 2: Multiple Specific Events
+ --WHERE E.EventID IN (284,285,286)
+
+-- OPTION 3: Event Range
+ --WHERE E.EventID BETWEEN 287 AND 289
+
+-- OPTION 4: All events (BE VERY CAREFUL)
+-- WHERE 1 = 1
+-- =====================================================================
+
+
+/* Quick check */
+IF NOT EXISTS (SELECT 1 FROM #EventMain)
+BEGIN
+    PRINT 'No events found for deletion.';
+    RETURN;
+END
+
+DECLARE @Loop INT = 1, @MaxLoop INT = (SELECT MAX(EKID) FROM #EventMain);
+DECLARE @RowCount INT;
+
+WHILE (@Loop <= @MaxLoop)
+BEGIN
+    SET @iEventID = (SELECT EventID FROM #EventMain WHERE EKID = @Loop);
+    SET @sEventName = (SELECT EventName FROM #EventMain WHERE EKID = @Loop);
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        PRINT 'Processing Event ID: ' + CAST(@iEventID AS VARCHAR(12)) + ' (' + @sEventName + ')';
+
+        -- Check for package references
+        DECLARE @PackageItemCount INT = 0, 
+                @PackageDateCount INT = 0,
+                @PackageDirectCount INT = 0;
+
+        SELECT @PackageItemCount = COUNT(*)
+        FROM PackageItemEventdateTimeslot PIETS
+        INNER JOIN EventDateFacilityTimeslot EDFT ON PIETS.EventDateFacilityTimeslotID = EDFT.EventDateFacilityTimeslotID
+        INNER JOIN EventDate ED ON EDFT.EventDateID = ED.EventDateID
+        WHERE ED.EventID = @iEventID;
+
+        SELECT @PackageDateCount = COUNT(*)
+        FROM PackageDate PD
+        INNER JOIN EventDate ED ON PD.EventDateID = ED.EventDateID
+        WHERE ED.EventID = @iEventID;
+
+        -- NEW: Direct Package reference check
+        SELECT @PackageDirectCount = COUNT(*)
+        FROM Package P
+        WHERE P.EventID = @iEventID;
+
+        IF (@PackageItemCount > 0 OR @PackageDateCount > 0 OR @PackageDirectCount > 0) 
+           AND @GlobalForceDelete = 0
+        BEGIN
+            ROLLBACK TRANSACTION;
+            PRINT 'SKIPPED: EventID ' + CAST(@iEventID AS VARCHAR(10)) + ' has package references.';
+            INSERT INTO @Log VALUES (
+                @iEventID, @sEventName, 'SKIPPED',
+                'Skipped because package references exist (PackageItemEventdateTimeslot / PackageDate / Package). Use @GlobalForceDelete=1 to force delete.',
+                GETDATE()
+            );
+            SET @Loop = @Loop + 1;
+            CONTINUE;
+        END
+
+        -- Force delete package references if allowed
+        IF @GlobalForceDelete = 1 AND (@PackageItemCount > 0 OR @PackageDateCount > 0 OR @PackageDirectCount > 0)
+        BEGIN
+            PRINT 'FORCE DELETE: Removing package refs for EventID ' + CAST(@iEventID AS VARCHAR(10));
+
+            DELETE PIETS FROM PackageItemEventdateTimeslot PIETS
+            INNER JOIN EventDateFacilityTimeslot EDFT ON PIETS.EventDateFacilityTimeslotID = EDFT.EventDateFacilityTimeslotID
+            INNER JOIN EventDate ED ON EDFT.EventDateID = ED.EventDateID
+            WHERE ED.EventID = @iEventID;
+            PRINT 'Deleted PackageItemEventdateTimeslot: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+            DELETE PDT FROM PackageDateTimeslot PDT
+            INNER JOIN PackageDate PD ON PDT.PackageDateID = PD.PackageDateID
+            INNER JOIN EventDate ED ON PD.EventDateID = ED.EventDateID
+            WHERE ED.EventID = @iEventID;
+            PRINT 'Deleted PackageDateTimeslot: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+            DELETE PID FROM PackageItemDate PID
+            INNER JOIN PackageDate PD ON PID.PackageDateID = PD.PackageDateID
+            INNER JOIN EventDate ED ON PD.EventDateID = ED.EventDateID
+            WHERE ED.EventID = @iEventID;
+            PRINT 'Deleted PackageItemDate: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+            DELETE PD FROM PackageDate PD
+            INNER JOIN EventDate ED ON PD.EventDateID = ED.EventDateID
+            WHERE ED.EventID = @iEventID;
+            PRINT 'Deleted PackageDate: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+            -- NEW: Delete direct package references
+            DELETE FROM Package WHERE EventID = @iEventID;
+            PRINT 'Deleted Package: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+        END
+
+        -- Delete child records first
+        IF OBJECT_ID('tempdb..#DateFacilityConfigIds') IS NOT NULL DROP TABLE #DateFacilityConfigIds;
+
+        SELECT DISTINCT DFC.DateFacilityConfigurationId
+        INTO #DateFacilityConfigIds
+        FROM DateFacilityConfiguration DFC
+        INNER JOIN EventDateFacilityTimeslot EDFT ON DFC.DateFacilityConfigurationId = EDFT.DateFacilityConfigurationId
+        INNER JOIN EventDate ED ON EDFT.EventDateID = ED.EventDateID
+        WHERE ED.EventID = @iEventID;
+
+        DELETE EDFT FROM EventDateFacilityTimeslot EDFT
+        INNER JOIN EventDate ED ON EDFT.EventDateID = ED.EventDateID
+        WHERE ED.EventID = @iEventID;
+        PRINT 'Deleted EventDateFacilityTimeslot: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+        DELETE DFCD FROM DateFacilityConfigurationDetail DFCD
+        INNER JOIN #DateFacilityConfigIds DFCIDs ON DFCD.DateFacilityConfigurationId = DFCIDs.DateFacilityConfigurationId;
+        PRINT 'Deleted DateFacilityConfigurationDetail: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+        DELETE DFC FROM DateFacilityConfiguration DFC
+        INNER JOIN #DateFacilityConfigIds DFCIDs ON DFC.DateFacilityConfigurationId = DFCIDs.DateFacilityConfigurationId
+        WHERE NOT EXISTS (
+            SELECT 1 FROM EventDateFacilityTimeslot EDFT2 WHERE EDFT2.DateFacilityConfigurationId = DFC.DateFacilityConfigurationId
+        );
+        PRINT 'Deleted DateFacilityConfiguration: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+        DELETE ED FROM EventDate ED WHERE ED.EventID = @iEventID;
+        PRINT 'Deleted EventDate: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+        DELETE EF FROM EventFacility EF WHERE EF.EventID = @iEventID;
+        PRINT 'Deleted EventFacility: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+        DELETE E FROM Event E WHERE E.EventID = @iEventID;
+        PRINT 'Deleted Event: ' + CAST(@@ROWCOUNT AS VARCHAR(10));
+
+        COMMIT TRANSACTION;
+
+        INSERT INTO @Log VALUES (@iEventID, @sEventName, 'SUCCESS', 'Event deleted successfully.', GETDATE());
+        PRINT 'SUCCESS: EventID ' + CAST(@iEventID AS VARCHAR(10)) + ' deleted.';
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        DECLARE @Err NVARCHAR(4000) = ERROR_MESSAGE();
+        INSERT INTO @Log VALUES (@iEventID, @sEventName, 'ERROR', @Err, GETDATE());
+        PRINT 'ERROR: EventID ' + CAST(@iEventID AS VARCHAR(10)) + ' failed. Msg: ' + @Err;
+    END CATCH
+
+    IF OBJECT_ID('tempdb..#DateFacilityConfigIds') IS NOT NULL DROP TABLE #DateFacilityConfigIds;
+
+    SET @Loop = @Loop + 1;
+END
+
+-- Final summary
+PRINT '=====================================';
+PRINT 'Deletion Summary:';
+SELECT * FROM @Log;
+PRINT '=====================================';
+PRINT 'Script finished.';
